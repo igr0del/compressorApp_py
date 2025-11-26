@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """Desktop GUI for converting images to compact WEBP files."""
 
+import importlib
+import os
+import shutil
 import sys
 import threading
 import time
@@ -8,21 +11,33 @@ from io import BytesIO
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-try:
-    import rawpy
+rawpy_spec = importlib.util.find_spec("rawpy")
+if rawpy_spec:
+    rawpy = importlib.import_module("rawpy")
     RAWPY_AVAILABLE = True
-except ImportError:  # pragma: no cover - optional dependency
+else:  # pragma: no cover - optional dependency
     rawpy = None
     RAWPY_AVAILABLE = False
 
 from PIL import Image
 
-try:
-    from pillow_heif import register_heif_opener
+pillow_heif_spec = importlib.util.find_spec("pillow_heif")
+if pillow_heif_spec:
+    pillow_heif = importlib.import_module("pillow_heif")
+    register_heif_opener = pillow_heif.register_heif_opener
     PILLOW_HEIF_AVAILABLE = True
-except ImportError:  # pragma: no cover - optional dependency
+else:  # pragma: no cover - optional dependency
     register_heif_opener = None
     PILLOW_HEIF_AVAILABLE = False
+
+psutil_spec = importlib.util.find_spec("psutil")
+if psutil_spec:
+    psutil = importlib.import_module("psutil")
+    PSUTIL_AVAILABLE = True
+else:  # pragma: no cover - optional dependency
+    psutil = None
+    PSUTIL_AVAILABLE = False
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -240,6 +255,7 @@ def process_folder(
     output_dir: Path,
     log_func: LogFunc = log_to_console,
     progress_callback: Optional[Callable[[int, int, float, str], None]] = None,
+    stop_event: Optional[threading.Event] = None,
 ) -> None:
     """Process all supported images in a folder tree."""
     all_files = collect_files(input_dir)
@@ -281,6 +297,10 @@ def process_folder(
 
     try:
         for idx, (src, dst) in enumerate(todo, start=1):
+            if stop_event and stop_event.is_set():
+                log_func("\nОстановка по запросу пользователя.")
+                break
+
             rel_path = src.relative_to(input_dir)
             log_func(f">> [{idx}/{total_todo}] Обработка: {rel_path}")
 
@@ -325,16 +345,25 @@ class CompressionApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Сжатие изображений в WEBP")
-        self.root.geometry("820x600")
+        self.root.geometry("880x680")
 
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Готов к работе")
         self.current_file_var = tk.StringVar(value="Файл: —")
+        self.cpu_var = tk.StringVar(value="—")
+        self.mem_var = tk.StringVar(value="—")
+        self.disk_var = tk.StringVar(value="—")
+        self.task_var = tk.StringVar(value="Ход работы будет показан здесь")
 
         self._worker: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._metrics_job: Optional[str] = None
+        self._cancel_requested = False
 
         self._build_ui()
+        self._schedule_metrics_update()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
         padding = {"padx": 12, "pady": 8}
@@ -345,64 +374,94 @@ class CompressionApp:
         except tk.TclError:
             pass
 
-        accent = "#3b82f6"
-        bg = "#f5f7fb"
+        accent = "#6366f1"
+        accent_dark = "#4f46e5"
+        warn = "#f59e0b"
+        danger = "#ef4444"
+        bg = "#eef2ff"
+        card_bg = "#ffffff"
         self.root.configure(bg=bg)
+
         style.configure("TFrame", background=bg)
-        style.configure("TLabel", background=bg)
-        style.configure("Header.TLabel", font=("Inter", 18, "bold"), background=bg)
+        style.configure("Card.TFrame", background=card_bg, relief="flat", borderwidth=0)
+        style.configure("TLabel", background=bg, font=("Inter", 11))
+        style.configure("Header.TLabel", font=("Inter", 20, "bold"), background=bg)
         style.configure("Subheader.TLabel", font=("Inter", 11), foreground="#4b5563", background=bg)
-        style.configure("Accent.TButton", font=("Inter", 11, "bold"), padding=6)
-        style.configure("TEntry", padding=6)
+        style.configure("Accent.TButton", font=("Inter", 11, "bold"), padding=8)
+        style.configure("Warn.TButton", font=("Inter", 11, "bold"), padding=8)
+        style.configure("Danger.TButton", font=("Inter", 11, "bold"), padding=8)
+        style.configure("TEntry", padding=8, foreground="#111827")
         style.configure(
             "Custom.Horizontal.TProgressbar",
-            thickness=14,
+            thickness=16,
             troughcolor="#e5e7eb",
             background=accent,
             bordercolor="#e5e7eb",
             lightcolor=accent,
             darkcolor=accent,
         )
-
-        header = ttk.Frame(self.root)
-        header.pack(fill="x", **padding)
-        ttk.Label(header, text="Сжатие изображений в WEBP", style="Header.TLabel").pack(
-            anchor="w"
+        style.map(
+            "Accent.TButton",
+            background=[("active", accent_dark), ("!disabled", accent)],
+            foreground=[("disabled", "#9ca3af"), ("!disabled", "white")],
         )
-        ttk.Label(
-            header,
-            text="Быстро уменьшайте фотографии до ~300KB без лишних действий.",
-            style="Subheader.TLabel",
-        ).pack(anchor="w", pady=(0, 4))
+        style.map(
+            "Warn.TButton",
+            background=[("active", "#d97706"), ("!disabled", warn)],
+            foreground=[("disabled", "#9ca3af"), ("!disabled", "white")],
+        )
+        style.map(
+            "Danger.TButton",
+            background=[("active", "#dc2626"), ("!disabled", danger)],
+            foreground=[("disabled", "#9ca3af"), ("!disabled", "white")],
+        )
 
-        input_frame = ttk.LabelFrame(self.root, text="Входная папка")
+        hero = tk.Frame(self.root, bg="#1f2937", padx=16, pady=14)
+        hero.pack(fill="x", pady=(8, 12), padx=10)
+        tk.Label(
+            hero,
+            text="WEBP компрессор",
+            font=("Inter", 22, "bold"),
+            fg="#fff",
+            bg="#1f2937",
+        ).pack(anchor="w")
+        tk.Label(
+            hero,
+            text="Красивый интерфейс, плавный прогресс и контроль загрузки системы в одном окне.",
+            font=("Inter", 12),
+            fg="#e5e7eb",
+            bg="#1f2937",
+        ).pack(anchor="w", pady=(4, 0))
+
+        io_frame = ttk.Frame(self.root, style="Card.TFrame")
+        io_frame.pack(fill="x", padx=12, pady=(0, 8))
+
+        input_frame = ttk.LabelFrame(io_frame, text="Входная папка", padding=10)
         input_frame.pack(fill="x", **padding)
-
         ttk.Entry(input_frame, textvariable=self.input_var).pack(
-            side="left", fill="x", expand=True, padx=(10, 5), pady=10
+            side="left", fill="x", expand=True, padx=(6, 8), pady=6
         )
         ttk.Button(
             input_frame,
-            text="Выбрать папку",
+            text="Выбрать",
             command=self.select_input,
             style="Accent.TButton",
-        ).pack(side="left", padx=10, pady=10)
+        ).pack(side="left", padx=4, pady=6)
 
-        output_frame = ttk.LabelFrame(self.root, text="Папка для сохранения")
+        output_frame = ttk.LabelFrame(io_frame, text="Папка для сохранения", padding=10)
         output_frame.pack(fill="x", **padding)
-
         ttk.Entry(output_frame, textvariable=self.output_var).pack(
-            side="left", fill="x", expand=True, padx=(10, 5), pady=10
+            side="left", fill="x", expand=True, padx=(6, 8), pady=6
         )
         ttk.Button(
             output_frame,
-            text="Куда складывать",
+            text="Указать",
             command=self.select_output,
             style="Accent.TButton",
-        ).pack(side="left", padx=10, pady=10)
+        ).pack(side="left", padx=4, pady=6)
 
-        control_frame = ttk.Frame(self.root)
-        control_frame.pack(fill="x", **padding)
+        control_frame = ttk.Frame(self.root, style="Card.TFrame")
+        control_frame.pack(fill="x", padx=12, pady=(0, 8))
 
         self.progress = ttk.Progressbar(
             control_frame,
@@ -410,29 +469,76 @@ class CompressionApp:
             mode="determinate",
             style="Custom.Horizontal.TProgressbar",
         )
-        self.progress.pack(fill="x", expand=True, side="left")
+        self.progress.pack(fill="x", expand=True, padx=10, pady=(12, 6))
 
-        ttk.Button(
-            control_frame,
-            text="Начать сжатие",
+        ttk.Label(control_frame, textvariable=self.task_var, style="Subheader.TLabel").pack(
+            anchor="w", padx=12
+        )
+
+        buttons = ttk.Frame(control_frame, style="Card.TFrame")
+        buttons.pack(fill="x", padx=8, pady=(6, 12))
+        self.start_btn = ttk.Button(
+            buttons,
+            text="Старт",
             command=self.start_processing,
             style="Accent.TButton",
-        ).pack(side="left", padx=(10, 0))
-
-        status_frame = ttk.Frame(self.root)
-        status_frame.pack(fill="x", **padding)
-        ttk.Label(status_frame, textvariable=self.status_var, font=("Inter", 11, "bold")).pack(
-            anchor="w"
+            width=16,
         )
-        ttk.Label(status_frame, textvariable=self.current_file_var, style="Subheader.TLabel").pack(
-            anchor="w"
+        self.start_btn.pack(side="left", padx=(2, 6))
+
+        self.stop_btn = ttk.Button(
+            buttons,
+            text="Стоп",
+            command=self.stop_processing,
+            style="Warn.TButton",
+            width=14,
+            state="disabled",
         )
+        self.stop_btn.pack(side="left", padx=6)
 
-        log_frame = ttk.LabelFrame(self.root, text="Ход работы")
-        log_frame.pack(fill="both", expand=True, **padding)
+        self.cancel_btn = ttk.Button(
+            buttons,
+            text="Отмена",
+            command=self.cancel_processing,
+            style="Danger.TButton",
+            width=14,
+            state="disabled",
+        )
+        self.cancel_btn.pack(side="left", padx=6)
 
-        self.log_text = ScrolledText(log_frame, height=18, state="disabled")
-        self.log_text.pack(fill="both", expand=True, padx=10, pady=10)
+        status_frame = ttk.Frame(self.root, style="Card.TFrame")
+        status_frame.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Label(status_frame, textvariable=self.status_var, font=("Inter", 12, "bold"), background=card_bg).pack(
+            anchor="w", padx=12, pady=(8, 0)
+        )
+        ttk.Label(
+            status_frame,
+            textvariable=self.current_file_var,
+            style="Subheader.TLabel",
+            background=card_bg,
+        ).pack(anchor="w", padx=12, pady=(0, 10))
+
+        metrics = ttk.Frame(self.root, style="Card.TFrame")
+        metrics.pack(fill="x", padx=12, pady=(0, 8))
+
+        for idx, (label, var, color) in enumerate(
+            [
+                ("ЦП", self.cpu_var, "#dbeafe"),
+                ("Память", self.mem_var, "#dcfce7"),
+                ("Диск", self.disk_var, "#fef9c3"),
+            ]
+        ):
+            card = tk.Frame(metrics, bg=color, padx=12, pady=10, bd=0)
+            card.grid(row=0, column=idx, sticky="nsew", padx=8, pady=8)
+            tk.Label(card, text=label, font=("Inter", 11, "bold"), bg=color).pack(anchor="w")
+            tk.Label(card, textvariable=var, font=("Inter", 12), bg=color).pack(anchor="w", pady=(2, 0))
+            metrics.columnconfigure(idx, weight=1)
+
+        log_frame = ttk.LabelFrame(self.root, text="Ход работы", padding=10)
+        log_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        self.log_text = ScrolledText(log_frame, height=16, state="disabled", font=("JetBrains Mono", 10))
+        self.log_text.pack(fill="both", expand=True, padx=6, pady=6)
 
     def select_input(self) -> None:
         folder = filedialog.askdirectory(title="Выберите папку с изображениями")
@@ -463,6 +569,10 @@ class CompressionApp:
             eta = format_time(remaining) if remaining else "—"
             self.status_var.set(f"Готово: {done}/{total} | Осталось: {eta}")
             self.current_file_var.set(f"Файл: {current if current else '—'}")
+            if current:
+                self.task_var.set(f"Обрабатываю: {current} | ETA: {eta}")
+            else:
+                self.task_var.set("Задача завершена")
 
         self.root.after(0, _update)
 
@@ -484,10 +594,12 @@ class CompressionApp:
 
         self.status_var.set("Запускаю сжатие...")
         self.current_file_var.set("Файл: —")
+        self.task_var.set("Подготовка к сжатию...")
         self.progress['value'] = 0
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.configure(state="disabled")
+        self._reset_log()
+        self._stop_event.clear()
+        self._cancel_requested = False
+        self._set_running_state(True)
 
         def worker() -> None:
             try:
@@ -496,6 +608,7 @@ class CompressionApp:
                     output_dir=output_dir,
                     log_func=self.log,
                     progress_callback=self.update_progress,
+                    stop_event=self._stop_event,
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 self.log(f"Ошибка: {exc}")
@@ -506,10 +619,145 @@ class CompressionApp:
                     ),
                 )
             finally:
-                self.root.after(0, lambda: self.status_var.set("Готово"))
+                cancelled = self._stop_event.is_set()
+                self.root.after(0, lambda: self._on_worker_complete(cancelled))
 
         self._worker = threading.Thread(target=worker, daemon=True)
         self._worker.start()
+
+    def stop_processing(self) -> None:
+        if not self._worker or not self._worker.is_alive():
+            messagebox.showinfo("Нет задачи", "Нечего останавливать — запустите сжатие.")
+            return
+
+        self._stop_event.set()
+        self.status_var.set("Останавливаю по запросу...")
+        self.task_var.set("Дождитесь завершения текущего файла")
+        self.stop_btn.state(["disabled"])
+        self._cancel_requested = False
+
+    def cancel_processing(self) -> None:
+        if self._worker and self._worker.is_alive():
+            self._stop_event.set()
+            self.status_var.set("Отмена: текущая задача остановится")
+            self.task_var.set("Сбрасываю очередь")
+            self._cancel_requested = True
+        else:
+            self._reset_after_stop()
+
+    def _reset_log(self) -> None:
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+
+    def _set_running_state(self, running: bool) -> None:
+        if running:
+            self.start_btn.state(["disabled"])
+            self.stop_btn.state(["!disabled"])
+            self.cancel_btn.state(["!disabled"])
+        else:
+            self.start_btn.state(["!disabled"])
+            self.stop_btn.state(["disabled"])
+            self.cancel_btn.state(["disabled"])
+
+    def _on_worker_complete(self, cancelled: bool) -> None:
+        self._worker = None
+        self._set_running_state(False)
+        if cancelled:
+            if self._cancel_requested:
+                self._reset_after_stop()
+                self.status_var.set("Отменено пользователем")
+            else:
+                self.status_var.set("Остановлено пользователем")
+                self.task_var.set("Задача прервана")
+        else:
+            self.status_var.set("Готово")
+            self.task_var.set("Можно запускать следующую партию")
+        self.current_file_var.set("Файл: —")
+        self._stop_event.clear()
+        self._cancel_requested = False
+
+    def _schedule_metrics_update(self) -> None:
+        self._update_metrics()
+        self._metrics_job = self.root.after(1000, self._schedule_metrics_update)
+
+    def _update_metrics(self) -> None:
+        cpu = self._cpu_usage()
+        mem = self._memory_usage()
+        disk = self._disk_usage()
+
+        self.cpu_var.set(cpu)
+        self.mem_var.set(mem)
+        self.disk_var.set(disk)
+
+    def _cpu_usage(self) -> str:
+        if PSUTIL_AVAILABLE:
+            return f"{psutil.cpu_percent(interval=None):.0f}%"
+        try:
+            load1, _, _ = os.getloadavg()
+            cores = max(os.cpu_count() or 1, 1)
+            return f"{min(load1 / cores * 100, 400):.0f}% (load avg)"
+        except OSError:
+            return "—"
+
+    def _memory_usage(self) -> str:
+        if PSUTIL_AVAILABLE:
+            info = psutil.virtual_memory()
+            used_gb = info.used / 1024**3
+            total_gb = info.total / 1024**3
+            return f"{info.percent:.0f}% ({used_gb:.1f}/{total_gb:.1f} ГБ)"
+
+        percent = self._read_meminfo_percent()
+        return f"{percent:.0f}% (по /proc/meminfo)" if percent is not None else "—"
+
+    def _disk_usage(self) -> str:
+        try:
+            base_path = self.output_var.get().strip() or str(Path.home())
+            usage = shutil.disk_usage(base_path)
+            used_gb = usage.used / 1024**3
+            total_gb = usage.total / 1024**3
+            percent = usage.used / usage.total * 100
+            return f"{percent:.0f}% ({used_gb:.1f}/{total_gb:.1f} ГБ)"
+        except OSError:
+            return "—"
+
+    def _read_meminfo_percent(self) -> Optional[float]:
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+                content = fh.read()
+        except OSError:
+            return None
+
+        mem_total = None
+        mem_available = None
+        for line in content.splitlines():
+            if line.startswith("MemTotal"):
+                mem_total = float(line.split()[1])
+            if line.startswith("MemAvailable"):
+                mem_available = float(line.split()[1])
+            if mem_total and mem_available:
+                break
+
+        if not mem_total or not mem_available:
+            return None
+
+        used = mem_total - mem_available
+        return used / mem_total * 100
+
+    def _reset_after_stop(self) -> None:
+        self._set_running_state(False)
+        self.status_var.set("Готов к работе")
+        self.task_var.set("Ход работы будет показан здесь")
+        self.current_file_var.set("Файл: —")
+        self.progress['value'] = 0
+        self._reset_log()
+
+    def _on_close(self) -> None:
+        if self._worker and self._worker.is_alive():
+            self._stop_event.set()
+        if self._metrics_job:
+            self.root.after_cancel(self._metrics_job)
+        self.root.destroy()
 
 
 def run_cli(argv: list[str]) -> None:
