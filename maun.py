@@ -214,7 +214,7 @@ def process_folder(
     input_dir: Path,
     output_dir: Path,
     log_func: LogFunc = log_to_console,
-    progress_callback: Optional[Callable[[int, int, float], None]] = None,
+    progress_callback: Optional[Callable[[int, int, float, str], None]] = None,
 ) -> None:
     """Process all supported images in a folder tree."""
     all_files = collect_files(input_dir)
@@ -223,7 +223,7 @@ def process_folder(
     if total_found == 0:
         log_func("Нет изображений для обработки.")
         if progress_callback:
-            progress_callback(0, 0, 0.0)
+            progress_callback(0, 0, 0.0, "")
         return
 
     todo = []
@@ -248,7 +248,7 @@ def process_folder(
     if total_todo == 0:
         log_func("Все файлы уже обработаны, делать больше нечего.")
         if progress_callback:
-            progress_callback(total_found, total_found, 0.0)
+            progress_callback(total_found, total_found, 0.0, "")
         return
 
     start_time = time.time()
@@ -270,7 +270,7 @@ def process_folder(
             log_func("-" * 80)
 
             if progress_callback:
-                progress_callback(done, total_todo, remaining)
+                progress_callback(done, total_todo, remaining, str(rel_path))
 
     except KeyboardInterrupt:
         log_func("\n\nОстановка по запросу пользователя (Ctrl+C).")
@@ -291,7 +291,7 @@ def process_folder(
         log_func("Все запланированные файлы обработаны.\n")
 
     if progress_callback:
-        progress_callback(done, total_todo, 0.0)
+        progress_callback(done, total_todo, 0.0, "")
 
 
 class CompressionApp:
@@ -299,19 +299,56 @@ class CompressionApp:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("WEBP Compressor")
-        self.root.geometry("720x520")
+        self.root.title("Сжатие изображений в WEBP")
+        self.root.geometry("820x600")
 
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Готов к работе")
+        self.current_file_var = tk.StringVar(value="Файл: —")
 
         self._worker: Optional[threading.Thread] = None
 
         self._build_ui()
 
     def _build_ui(self) -> None:
-        padding = {"padx": 10, "pady": 5}
+        padding = {"padx": 12, "pady": 8}
+
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        accent = "#3b82f6"
+        bg = "#f5f7fb"
+        self.root.configure(bg=bg)
+        style.configure("TFrame", background=bg)
+        style.configure("TLabel", background=bg)
+        style.configure("Header.TLabel", font=("Inter", 18, "bold"), background=bg)
+        style.configure("Subheader.TLabel", font=("Inter", 11), foreground="#4b5563", background=bg)
+        style.configure("Accent.TButton", font=("Inter", 11, "bold"), padding=6)
+        style.configure("TEntry", padding=6)
+        style.configure(
+            "Custom.Horizontal.TProgressbar",
+            thickness=14,
+            troughcolor="#e5e7eb",
+            background=accent,
+            bordercolor="#e5e7eb",
+            lightcolor=accent,
+            darkcolor=accent,
+        )
+
+        header = ttk.Frame(self.root)
+        header.pack(fill="x", **padding)
+        ttk.Label(header, text="Сжатие изображений в WEBP", style="Header.TLabel").pack(
+            anchor="w"
+        )
+        ttk.Label(
+            header,
+            text="Быстро уменьшайте фотографии до ~300KB без лишних действий.",
+            style="Subheader.TLabel",
+        ).pack(anchor="w", pady=(0, 4))
 
         input_frame = ttk.LabelFrame(self.root, text="Входная папка")
         input_frame.pack(fill="x", **padding)
@@ -320,7 +357,10 @@ class CompressionApp:
             side="left", fill="x", expand=True, padx=(10, 5), pady=10
         )
         ttk.Button(
-            input_frame, text="Выбрать", command=self.select_input
+            input_frame,
+            text="Выбрать папку",
+            command=self.select_input,
+            style="Accent.TButton",
         ).pack(side="left", padx=10, pady=10)
 
         output_frame = ttk.LabelFrame(self.root, text="Папка для сохранения")
@@ -330,29 +370,43 @@ class CompressionApp:
             side="left", fill="x", expand=True, padx=(10, 5), pady=10
         )
         ttk.Button(
-            output_frame, text="Выбрать", command=self.select_output
+            output_frame,
+            text="Куда складывать",
+            command=self.select_output,
+            style="Accent.TButton",
         ).pack(side="left", padx=10, pady=10)
 
         control_frame = ttk.Frame(self.root)
         control_frame.pack(fill="x", **padding)
 
         self.progress = ttk.Progressbar(
-            control_frame, orient="horizontal", mode="determinate"
+            control_frame,
+            orient="horizontal",
+            mode="determinate",
+            style="Custom.Horizontal.TProgressbar",
         )
         self.progress.pack(fill="x", expand=True, side="left")
 
-        ttk.Button(control_frame, text="Старт", command=self.start_processing).pack(
-            side="left", padx=(10, 0)
-        )
+        ttk.Button(
+            control_frame,
+            text="Начать сжатие",
+            command=self.start_processing,
+            style="Accent.TButton",
+        ).pack(side="left", padx=(10, 0))
 
         status_frame = ttk.Frame(self.root)
         status_frame.pack(fill="x", **padding)
-        ttk.Label(status_frame, textvariable=self.status_var).pack(anchor="w")
+        ttk.Label(status_frame, textvariable=self.status_var, font=("Inter", 11, "bold")).pack(
+            anchor="w"
+        )
+        ttk.Label(status_frame, textvariable=self.current_file_var, style="Subheader.TLabel").pack(
+            anchor="w"
+        )
 
-        log_frame = ttk.LabelFrame(self.root, text="Логи")
+        log_frame = ttk.LabelFrame(self.root, text="Ход работы")
         log_frame.pack(fill="both", expand=True, **padding)
 
-        self.log_text = ScrolledText(log_frame, height=20, state="disabled")
+        self.log_text = ScrolledText(log_frame, height=18, state="disabled")
         self.log_text.pack(fill="both", expand=True, padx=10, pady=10)
 
     def select_input(self) -> None:
@@ -377,12 +431,13 @@ class CompressionApp:
 
         self.root.after(0, append)
 
-    def update_progress(self, done: int, total: int, remaining: float) -> None:
+    def update_progress(self, done: int, total: int, remaining: float, current: str) -> None:
         def _update() -> None:
             percent = (done / total * 100) if total else 0
             self.progress['value'] = percent
             eta = format_time(remaining) if remaining else "—"
-            self.status_var.set(f"Готово: {done}/{total} | Оставшееся время: {eta}")
+            self.status_var.set(f"Готово: {done}/{total} | Осталось: {eta}")
+            self.current_file_var.set(f"Файл: {current if current else '—'}")
 
         self.root.after(0, _update)
 
@@ -403,6 +458,7 @@ class CompressionApp:
             output_dir = input_dir.parent / "compressed_webp"
 
         self.status_var.set("Запускаю сжатие...")
+        self.current_file_var.set("Файл: —")
         self.progress['value'] = 0
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
